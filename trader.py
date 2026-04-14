@@ -1,125 +1,77 @@
-from datamodel import OrderDepth, UserId, TradingState, Order
+from datamodel import Order, TradingState, OrderDepth
 from typing import List
-import string
 
 class Trader:
-
-    def bid(self):
-        return 15
-    
     def run(self, state: TradingState):
-        """Only method required. It takes all buy and sell orders for all
-        symbols as an input, and outputs a list of orders to be sent."""
-
-        print("traderData: " + state.traderData)
-        print("Observations: " + str(state.observations))
-
-        # Orders to be placed on exchange matching engine
         result = {}
+
         for product in state.order_depths:
             order_depth: OrderDepth = state.order_depths[product]
             orders: List[Order] = []
-            acceptable_price = 10  # Participant should calculate this value
-            print("Acceptable price : " + str(acceptable_price))
-            print("Buy Order depth : " + str(len(order_depth.buy_orders)) + ", Sell order depth : " + str(len(order_depth.sell_orders)))
-    
-            if len(order_depth.sell_orders) != 0:
-                best_ask, best_ask_amount = list(order_depth.sell_orders.items())[0]
-                if int(best_ask) < acceptable_price:
-                    print("BUY", str(-best_ask_amount) + "x", best_ask)
-                    orders.append(Order(product, best_ask, -best_ask_amount))
-    
-            if len(order_depth.buy_orders) != 0:
-                best_bid, best_bid_amount = list(order_depth.buy_orders.items())[0]
-                if int(best_bid) > acceptable_price:
-                    print("SELL", str(best_bid_amount) + "x", best_bid)
-                    orders.append(Order(product, best_bid, -best_bid_amount))
             
+            # 1. Identifiera marknadsläget
+            if not order_depth.buy_orders or not order_depth.sell_orders:
+                continue
+
+            best_bid = max(order_depth.buy_orders.keys())
+            best_ask = min(order_depth.sell_orders.keys())
+            mid_price = (best_bid + best_ask) / 2
+            current_spread = best_ask - best_bid
+            
+            # 2. Inställningar för produkten
+            POSITION_LIMIT = 80
+            current_position = state.position.get(product, 0)
+            
+            # Vi sätter vårt "Fair Value" till mid_price för enkelhetens skull
+            fair_price = mid_price 
+
+            # 3. Market Taking (Hämta pengar som ligger på bordet)
+            # Om någon säljer under vårt fair_price, köp direkt!
+            for ask, amount in sorted(order_depth.sell_orders.items()):
+                if (ask < fair_price) and current_position < POSITION_LIMIT:
+                    buy_qty = min(-amount, POSITION_LIMIT - current_position)
+                    orders.append(Order(product, ask, buy_qty))
+                    current_position += buy_qty
+
+            for bid, amount in sorted(order_depth.buy_orders.items(), reverse=True):
+                if (bid > fair_price) and current_position > -POSITION_LIMIT:
+                    sell_qty = max(-amount, -POSITION_LIMIT - current_position)
+                    orders.append(Order(product, bid, sell_qty))
+                    current_position += sell_qty
+
+            # 4. Market Making med Pennying & Position Shading
+            # Vi vill ligga 1 steg bättre än nuvarande best_bid/ask (Pennying)
+            # Men vi justerar priset baserat på hur nära limiten vi är (Shading)
+
+            # --- Beräkna vårt Köp-pris (Bid) ---
+            our_bid = best_bid + 1
+            # Om vi har för mycket i lager (t.ex. > 40), sänk vårt köppris 
+            # för att minska risken att vi köper ännu mer.
+            if current_position > 20:
+                our_bid = best_bid - 1 # Bli mindre aggressiv
+            if current_position > 60:
+                our_bid = best_bid - 3 # Bli väldigt defensiv
+
+            # --- Beräkna vårt Sälj-pris (Ask) ---
+            our_ask = best_ask - 1
+            # Om vi har en stor kort position (t.ex. < -40), höj vårt säljpris.
+            if current_position < -20:
+                our_ask = best_ask + 1
+            if current_position < -60:
+                our_ask = best_ask + 3
+
+            # 5. Skicka ordrarna (kontrollera mot limit)
+            # Lägg Köp-order
+            if current_position < POSITION_LIMIT:
+                bid_size = POSITION_LIMIT - current_position
+                orders.append(Order(product, int(our_bid), int(bid_size)))
+
+            # Lägg Sälj-order
+            if current_position > -POSITION_LIMIT:
+                ask_size = -POSITION_LIMIT - current_position
+                orders.append(Order(product, int(our_ask), int(ask_size)))
+
             result[product] = orders
-    
-        # String value holding Trader state data required. 
-        # It will be delivered as TradingState.traderData on next execution.
-        traderData = "SAMPLE" 
-        
-        # Sample conversion request. Check more details below. 
-        conversions = 1
-        return result, conversions, traderData
 
-Time = int
-Symbol = str
-Product = str
-Position = int
-
-class TradingState(object):
-   def __init__(self,
-                 traderData: str,
-                 timestamp: Time,
-                 listings: Dict[Symbol, Listing],
-                 order_depths: Dict[Symbol, OrderDepth],
-                 own_trades: Dict[Symbol, List[Trade]],
-                 market_trades: Dict[Symbol, List[Trade]],
-                 position: Dict[Product, Position],
-                 observations: Observation):
-        self.traderData = traderData
-        self.timestamp = timestamp
-        self.listings = listings
-        self.order_depths = order_depths
-        self.own_trades = own_trades
-        self.market_trades = market_trades
-        self.position = position
-        self.observations = observations
-        
-    def toJSON(self):
-        return json.dumps(self, default=lambda o: o.__dict__, sort_keys=True)
-   
-Symbol = str
-UserId = str
-
-class Trade:
-    def __init__(self, symbol: Symbol, price: int, quantity: int, buyer: UserId = None, seller: UserId = None, timestamp: int = 0) -> None:
-        self.symbol = symbol
-        self.price: int = price
-        self.quantity: int = quantity
-        self.buyer = buyer
-        self.seller = seller
-        self.timestamp = timestamp
-
-    def __str__(self) -> str:
-        return "(" + self.symbol + ", " + self.buyer + " << " + self.seller + ", " + str(self.price) + ", " + str(self.quantity) + ", " + str(self.timestamp) + ")"
-
-    def __repr__(self) -> str:
-        return "(" + self.symbol + ", " + self.buyer + " << " + self.seller + ", " + str(self.price) + ", " + str(self.quantity) + ", " + str(self.timestamp) + ")" + self.symbol + ", " + self.buyer + " << " + self.seller + ", " + str(self.price) + ", " + str(self.quantity) + ")"
-    
-class OrderDepth:
-    def __init__(self):
-        self.buy_orders: Dict[int, int] = {}
-        self.sell_orders: Dict[int, int] = {}
-
-class ConversionObservation:
-
-    def __init__(self, bidPrice: float, askPrice: float, transportFees: float, exportTariff: float, importTariff: float, sunlight: float, humidity: float):
-        self.bidPrice = bidPrice
-        self.askPrice = askPrice
-        self.transportFees = transportFees
-        self.exportTariff = exportTariff
-        self.importTariff = importTariff
-        self.sugarPrice = sugarPrice
-        self.sunlightIndex = sunlightIndex
-
-Symbol = str
-
-class Order:
-    def __init__(self, symbol: Symbol, price: int, quantity: int) -> None:
-        self.symbol = symbol
-        self.price = price
-        self.quantity = quantity
-
-    def __str__(self) -> str:
-        return "(" + self.symbol + ", " + str(self.price) + ", " + str(self.quantity) + ")"
-
-    def __repr__(self) -> str:
-        return "(" + self.symbol + ", " + str(self.price) + ", " + str(self.quantity) + ")"
-
-
-#postion limit
+        return result, 0, ""
 
