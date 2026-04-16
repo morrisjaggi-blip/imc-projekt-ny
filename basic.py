@@ -2,7 +2,7 @@ from datamodel import Order, TradingState, OrderDepth
 from typing import List
 
 class Trader:
-    def run(self, state: TradingState, imbalance_weight, inventory_weight):
+    def run(self, state: TradingState, imbalance_weight: float = 0.6, inventory_weight: float = 0.4):
         result = {}
 
         for product in state.order_depths:
