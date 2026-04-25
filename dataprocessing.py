@@ -13,10 +13,12 @@ PRICE_COLS_BID = ["bid_price_1", "bid_price_2", "bid_price_3"]
 PRICE_COLS_ASK = ["ask_price_1", "ask_price_2", "ask_price_3"]
 VOL_COLS_BID = ["bid_volume_1", "bid_volume_2", "bid_volume_3"]
 VOL_COLS_ASK = ["ask_volume_1", "ask_volume_2", "ask_volume_3"]
+CSV_NAME_RE = re.compile(r"^(prices|trades)_round_(-?\d+)_day_(-?\d+)\.csv$", re.IGNORECASE)
 
 
 def load_prosperity_csv(path: str | Path) -> pd.DataFrame:
     path = _resolve_input_path(path)
+    _, round_number, day_number = parse_csv_filename(path)
     header = _locate_header(path)
     sep = _detect_separator(header)
     skiprows = _count_preamble_lines(path, header)
@@ -47,18 +49,30 @@ def load_prosperity_csv(path: str | Path) -> pd.DataFrame:
             )
         raise ValueError(f"{path}: missing required columns: {sorted(missing)}")
 
-    return df.sort_values(["day", "timestamp", "product"]).reset_index(drop=True)
+    out = df.copy()
+    out["round"] = round_number
+    out["day"] = day_number
+    return out.sort_values(["round", "day", "timestamp", "product"]).reset_index(drop=True)
+
+
+def parse_csv_filename(path: str | Path) -> tuple[str, int, int]:
+    match = CSV_NAME_RE.match(Path(path).name)
+    if not match:
+        raise ValueError(
+            f"{path}: expected filename like prices_round_3_day_0.csv "
+            "or trades_round_3_day_0.csv"
+        )
+    kind, round_number, day_number = match.groups()
+    return kind.lower(), int(round_number), int(day_number)
 
 
 def parse_day_from_filename(path: str | Path) -> int:
-    match = re.search(r"day_(-?\d+)", Path(path).name)
-    if not match:
-        raise ValueError(f"{path}: could not infer day from filename")
-    return int(match.group(1))
+    return parse_csv_filename(path)[2]
 
 
 def load_trades_csv(path: str | Path) -> pd.DataFrame:
     path = _resolve_input_path(path)
+    _, round_number, day_number = parse_csv_filename(path)
     header = _locate_header(path)
     sep = _detect_separator(header)
     skiprows = _count_preamble_lines(path, header)
@@ -78,8 +92,9 @@ def load_trades_csv(path: str | Path) -> pd.DataFrame:
         raise ValueError(f"{path}: missing required columns: {sorted(missing)}")
 
     out = df.rename(columns={"symbol": "product"}).copy()
-    out["day"] = parse_day_from_filename(path)
-    return out.sort_values(["day", "timestamp", "product"]).reset_index(drop=True)
+    out["round"] = round_number
+    out["day"] = day_number
+    return out.sort_values(["round", "day", "timestamp", "product"]).reset_index(drop=True)
 
 
 def _resolve_input_path(path: str | Path) -> Path:
@@ -155,9 +170,9 @@ def add_features(df: pd.DataFrame) -> pd.DataFrame:
         np.nan,
     )
 
-    # Rolling diagnostics must be computed within each product/day stream.
-    out = out.sort_values(["product", "day", "timestamp"]).reset_index(drop=True)
-    g = out.groupby(["product", "day"], group_keys=False)
+    # Rolling diagnostics must be computed within each product/round/day stream.
+    out = out.sort_values(["product", "round", "day", "timestamp"]).reset_index(drop=True)
+    g = out.groupby(["product", "round", "day"], group_keys=False)
 
     out["mid_rolling_50"] = g["mid_price_clean"].transform(
         lambda s: s.rolling(50, min_periods=1).mean()
@@ -196,91 +211,160 @@ def plot_empirical_pmf(
     plt.close()
 
 
-def plot_product_day(
+def plot_pmf_on_axis(ax, values: pd.Series, xlabel: str, title: str) -> bool:
+    clean = values.dropna()
+    if clean.empty:
+        ax.set_visible(False)
+        return False
+
+    pmf = clean.value_counts(normalize=True).sort_index()
+    ax.bar(pmf.index.astype(str), pmf.values, width=0.8)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel("Probability")
+    ax.set_title(title)
+    ax.tick_params(axis="x", rotation=45)
+    for label in ax.get_xticklabels():
+        label.set_horizontalalignment("right")
+    return True
+
+
+def make_panel_axes(n_panels: int):
+    n_cols = min(2, n_panels)
+    n_rows = int(np.ceil(n_panels / n_cols))
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(10 * n_cols, 5 * n_rows))
+    axes = np.atleast_1d(axes).ravel()
+    for ax in axes[n_panels:]:
+        ax.set_visible(False)
+    return fig, axes
+
+
+def combined_time_axis(subset: pd.DataFrame, days: list[int]) -> pd.Series:
+    combined = pd.Series(index=subset.index, dtype=float)
+    offset = 0
+    for day in days:
+        day_mask = subset["day"] == day
+        day_time = (subset.loc[day_mask, "timestamp"] // 100).sort_values()
+        if day_time.empty:
+            continue
+
+        shifted = day_time - day_time.iloc[0] + offset
+        combined.loc[shifted.index] = shifted
+        step = shifted.diff().dropna().min()
+        if pd.isna(step) or step <= 0:
+            step = 1
+        offset = shifted.iloc[-1] + step
+    return combined
+
+
+def plot_product_price_time_panel(
     df: pd.DataFrame,
-    trades_df: pd.DataFrame,
     product: str,
-    day: int,
+    round_number: int,
+    days: list[int],
     output_dir: Path,
 ) -> None:
-    subset = df[(df["product"] == product) & (df["day"] == day)].copy()
+    subset = df[
+        (df["product"] == product)
+        & (df["round"] == round_number)
+        & (df["day"].isin(days))
+    ].copy()
     if subset.empty:
         return
 
-    subset = subset.sort_values("timestamp")
-    t = subset["timestamp"] // 100
-    trades_subset = trades_df[
-        (trades_df["product"] == product) & (trades_df["day"] == day)
+    panels = [("Combined", subset.sort_values(["day", "timestamp"]))]
+    for day in days:
+        day_subset = subset[subset["day"] == day].sort_values("timestamp")
+        if not day_subset.empty:
+            panels.append((f"Day {day}", day_subset))
+
+    fig, axes = make_panel_axes(len(panels))
+    for ax, (title, panel_subset) in zip(axes, panels):
+        if title == "Combined":
+            t = combined_time_axis(panel_subset, days)
+            xlabel = "Combined time step"
+        else:
+            t = panel_subset["timestamp"] // 100
+            xlabel = "Time step"
+
+        ax.plot(t, panel_subset["mid_price_clean"], label="Mid price")
+        ax.plot(t, panel_subset["best_bid"], linestyle="--", label="Best bid")
+        ax.plot(t, panel_subset["best_ask"], linestyle="--", label="Best ask")
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel("Price")
+        ax.set_title(title)
+        ax.legend()
+
+    fig.suptitle(f"{product} | Price-time")
+    fig.tight_layout()
+    fig.savefig(output_dir / f"{sanitize(product)}_price_time.png", dpi=180)
+    plt.close(fig)
+
+
+def plot_product_spread_pmf_panel(
+    df: pd.DataFrame,
+    product: str,
+    round_number: int,
+    days: list[int],
+    output_dir: Path,
+) -> None:
+    subset = df[
+        (df["product"] == product)
+        & (df["round"] == round_number)
+        & (df["day"].isin(days))
     ].copy()
+    if subset.empty:
+        return
 
-    # Price-time
-    plt.figure(figsize=(20, 6))
-    plt.plot(t, subset["mid_price_clean"], label="Mid price")
-    plt.plot(t, subset["best_bid"], linestyle="--", label="Best bid")
-    plt.plot(t, subset["best_ask"], linestyle="--", label="Best ask")
-    #plt.plot(t, subset["mid_rolling_50"], linestyle=":", label="Mid (rolling 50)")
-    plt.xlabel("Time step")
-    plt.ylabel("Price")
-    plt.title(f"{product} | Day {day} | Price-time")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{sanitize(product)}_day_{day}_price_time.png", dpi=180)
-    plt.close()
+    panels = [("Combined", subset)]
+    for day in days:
+        day_subset = subset[subset["day"] == day]
+        if not day_subset.empty:
+            panels.append((f"Day {day}", day_subset))
 
-    # Spread-time
-    plt.figure(figsize=(12, 5))
-    plt.plot(t, subset["spread"], label="Spread")
-    plt.plot(t, subset["spread_rolling_50"], linestyle=":", label="Spread (rolling 50)")
-    plt.xlabel("Time step")
-    plt.ylabel("Spread")
-    plt.title(f"{product} | Day {day} | Spread-time")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{sanitize(product)}_day_{day}_spread_time.png", dpi=180)
-    plt.close()
+    fig, axes = make_panel_axes(len(panels))
+    for ax, (title, panel_subset) in zip(axes, panels):
+        plot_pmf_on_axis(ax, panel_subset["spread"], "Spread", title)
 
-    plot_empirical_pmf(
-        subset["spread"],
-        xlabel="Spread",
-        title=f"{product} | Day {day} | Spread PMF",
-        output_path=output_dir / f"{sanitize(product)}_day_{day}_spread_pmf.png",
-    )
+    fig.suptitle(f"{product} | Spread PMF")
+    fig.tight_layout()
+    fig.savefig(output_dir / f"{sanitize(product)}_spread_pmf.png", dpi=180)
+    plt.close(fig)
 
-    # Volume-time
-    plt.figure(figsize=(12, 5))
-    plt.plot(t, subset["total_bid_volume"], label="Total visible bid volume")
-    plt.plot(t, subset["total_ask_volume"], label="Total visible ask volume")
-    plt.xlabel("Time step")
-    plt.ylabel("Volume")
-    plt.title(f"{product} | Day {day} | Visible volume-time")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{sanitize(product)}_day_{day}_volume_time.png", dpi=180)
-    plt.close()
 
-    # Imbalance-time
-    plt.figure(figsize=(12, 5))
-    plt.plot(t, subset["imbalance_top"], label="Top-of-book imbalance")
-    plt.plot(t, subset["imbalance_full"], label="Full visible-book imbalance")
-    plt.xlabel("Time step")
-    plt.ylabel("Imbalance")
-    plt.title(f"{product} | Day {day} | Order-book imbalance")
-    plt.legend()
-    plt.tight_layout()
-    plt.savefig(output_dir / f"{sanitize(product)}_day_{day}_imbalance_time.png", dpi=180)
-    plt.close()
+def plot_product_price_pmf_panel(
+    trades_df: pd.DataFrame,
+    product: str,
+    round_number: int,
+    days: list[int],
+    output_dir: Path,
+) -> None:
 
-    if not trades_subset.empty:
-        plot_empirical_pmf(
-            trades_subset["price"],
-            xlabel="Trade price",
-            title=f"{product} | Day {day} | Price PMF",
-            output_path=output_dir / f"{sanitize(product)}_day_{day}_price_pmf.png",
-        )
+    trades_subset = trades_df[
+        (trades_df["product"] == product)
+        & (trades_df["round"] == round_number)
+        & (trades_df["day"].isin(days))
+    ].copy()
+    if trades_subset.empty:
+        return
+
+    panels = [("Combined", trades_subset)]
+    for day in days:
+        day_subset = trades_subset[trades_subset["day"] == day]
+        if not day_subset.empty:
+            panels.append((f"Day {day}", day_subset))
+
+    fig, axes = make_panel_axes(len(panels))
+    for ax, (title, panel_subset) in zip(axes, panels):
+        plot_pmf_on_axis(ax, panel_subset["price"], "Trade price", title)
+
+    fig.suptitle(f"{product} | Price PMF")
+    fig.tight_layout()
+    fig.savefig(output_dir / f"{sanitize(product)}_price_pmf.png", dpi=180)
+    plt.close(fig)
 
 
 def summarize_product_day(df: pd.DataFrame) -> pd.DataFrame:
-    summary = df.groupby(["day", "product"], as_index=False).agg(
+    summary = df.groupby(["round", "day", "product"], as_index=False).agg(
         n_rows=("timestamp", "size"),
         t_min=("timestamp", "min"),
         t_max=("timestamp", "max"),
@@ -295,7 +379,23 @@ def summarize_product_day(df: pd.DataFrame) -> pd.DataFrame:
         imbalance_full_mean=("imbalance_full", "mean"),
         imbalance_full_std=("imbalance_full", "std"),
     )
-    return summary.sort_values(["product", "day"]).reset_index(drop=True)
+    return summary.sort_values(["round", "product", "day"]).reset_index(drop=True)
+
+
+def get_round_output_dir(output_parent: Path, round_number: int) -> Path:
+    round_dir = output_parent / f"Plots_round_{round_number}"
+    round_dir.mkdir(parents=True, exist_ok=True)
+    return round_dir
+
+
+def get_diagram_output_dirs(round_dir: Path) -> tuple[Path, Path, Path]:
+    price_time_dir = round_dir / "Price-time diagrams"
+    price_pmf_dir = round_dir / "Price PMFs"
+    spread_pmf_dir = round_dir / "Spread PMFs"
+    price_time_dir.mkdir(parents=True, exist_ok=True)
+    price_pmf_dir.mkdir(parents=True, exist_ok=True)
+    spread_pmf_dir.mkdir(parents=True, exist_ok=True)
+    return price_time_dir, price_pmf_dir, spread_pmf_dir
 
 
 def main() -> None:
@@ -303,13 +403,13 @@ def main() -> None:
     parser.add_argument("csv_files", nargs="+", help="One or more Prosperity CSV files")
     parser.add_argument(
         "--output-dir",
-        default="prosperity_plots",
-        help="Directory where plots and summary CSV are written",
+        default=".",
+        help="Parent directory where Plots_round_[round] folders are written",
     )
     args = parser.parse_args()
 
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_parent = Path(args.output_dir)
+    output_parent.mkdir(parents=True, exist_ok=True)
 
     price_frames = []
     trade_frames = []
@@ -340,19 +440,47 @@ def main() -> None:
     trades = (
         pd.concat(trade_frames, ignore_index=True)
         if trade_frames
-        else pd.DataFrame(columns=["timestamp", "product", "price", "quantity", "day"])
+        else pd.DataFrame(columns=["timestamp", "product", "price", "quantity", "round", "day"])
     )
 
     feat = add_features(raw)
 
-    for product in sorted(feat["product"].dropna().unique()):
-        for day in sorted(feat["day"].dropna().unique()):
-            plot_product_day(feat, trades, product, day, output_dir)
+    for round_number in sorted(feat["round"].dropna().unique()):
+        round_dir = get_round_output_dir(output_parent, int(round_number))
+        price_time_dir, price_pmf_dir, spread_pmf_dir = get_diagram_output_dirs(round_dir)
+        round_days = sorted(feat.loc[feat["round"] == round_number, "day"].dropna().unique())
+        round_days = [int(day) for day in round_days]
+        for product in sorted(feat.loc[feat["round"] == round_number, "product"].dropna().unique()):
+            plot_product_price_time_panel(
+                feat,
+                product,
+                int(round_number),
+                round_days,
+                price_time_dir,
+            )
+            plot_product_spread_pmf_panel(
+                feat,
+                product,
+                int(round_number),
+                round_days,
+                spread_pmf_dir,
+            )
+        for product in sorted(trades.loc[trades["round"] == round_number, "product"].dropna().unique()):
+            plot_product_price_pmf_panel(
+                trades,
+                product,
+                int(round_number),
+                round_days,
+                price_pmf_dir,
+            )
 
     summary = summarize_product_day(feat)
-    summary.to_csv(output_dir / "summary_by_day_product.csv", index=False)
+    for round_number in sorted(summary["round"].dropna().unique()):
+        round_summary = summary[summary["round"] == round_number]
+        round_dir = get_round_output_dir(output_parent, int(round_number))
+        round_summary.to_csv(round_dir / "summary_by_day_product.csv", index=False)
 
-    print(f"Done. Output written to: {output_dir.resolve()}")
+    print(f"Done. Output written to: {output_parent.resolve()}")
 
 
 if __name__ == "__main__":
